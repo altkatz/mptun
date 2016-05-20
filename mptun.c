@@ -69,6 +69,9 @@ struct tundev {
 	uint64_t drop;
 	uint64_t untrack;
 	uint64_t invalid;
+        int proto;
+        int is_client;
+        int clientfd;
 };
 
 struct rc4_sbox {
@@ -443,30 +446,40 @@ utun_write(int fd, char *buf, int len)
 #endif
 
 static int
-inet_bind(INADDR *addr, int port) {
+inet_bind(INADDR *addr, int port, struct tundev *tdev) {
 	int reuse = 1;
+        int fd;
 	SOCKADDR address;
-	int fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		perror("socket");
-		return fd;
-	}
 	address.sin_family = AF_INET;
 	address.sin_addr = *addr;
 	address.sin_port = htons(port);
-
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&reuse, sizeof(int)) ==-1) {
-		close(fd);
-		return -1;
-	}
-
-	if (bind(fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
-		perror("bind");
-		close(fd);
-		return -1;
-	}
-
-	return fd;
+        int protocol;
+        if (tdev -> proto != 0){
+          protocol = SOCK_STREAM;
+        } else {
+          protocol = SOCK_DGRAM;
+        }
+        fd = socket(AF_INET, protocol, 0);
+        if (fd < 0) {
+                perror("socket");
+                return fd;
+        }
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&reuse, sizeof(int)) ==-1) {
+                close(fd);
+                return -1;
+        }
+        if (bind(fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
+                perror("bind");
+                close(fd);
+                return -1;
+        }
+        if (tdev -> proto != 0 && tdev -> is_client == 0){
+            if (listen(fd, 16)<0) {
+                perror("listen");
+                return -1;
+            }
+        }
+        return fd;
 }
 
 static void
@@ -480,6 +493,7 @@ usage(void) {
 		"\t-l <localIP> : specify local address, it can specify multi times. (or zero, if you run as server)\n"
 		"\t-p <port> : specify port for tunnel\n"
 		"\t-k <key> : optional password\n"
+		"\t-o <protocol> : optional tcp protocol \n"
 	);
 	exit(1);
 }
@@ -492,6 +506,7 @@ add_remote(struct tundev *tdev, SOCKADDR *addr, int bytes) {
 	for (i=0;i<tdev->remote_n;i++) {
 		if (memcmp(&addr->sin_addr, &tdev->remote[i].sin_addr, sizeof(INADDR))==0) {
 			tdev->remote[i].sin_port = addr->sin_port;	// update port (NAT may change port)
+                        fprintf(stderr, "client here!!!!");
 			if (++tdev->remote_count[i] > MAX_COUNT) {
 				int j;
 				for (j=0;j<tdev->remote_n;j++) {
@@ -501,6 +516,7 @@ add_remote(struct tundev *tdev, SOCKADDR *addr, int bytes) {
 			tdev->in[i] += bytes;
 			return;
 		} else if (tdev->remote_count[i] < mincount) {
+
 			mincount = tdev->remote_count[i];
 			minidx = i;
 		}
@@ -510,6 +526,7 @@ add_remote(struct tundev *tdev, SOCKADDR *addr, int bytes) {
 	} else {
 		i = minidx;
 	}
+        fprintf(stderr, "server here!!!!");
 	tdev->remote[i] = *addr;
 	tdev->remote_count[i] = 0;
 	tdev->untrack += tdev->in[i];
@@ -787,6 +804,234 @@ start(struct tundev *tdev) {
 }
 
 static void
+tun_to_inet_tcp(struct tundev *tdev, fd_set *wt) {
+	int tunfd = tdev->tunfd;
+	int localindex = 0;
+	int inetfd = tdev->clientfd;
+	int remoteindex = 0;
+	SOCKADDR * addr = &tdev->remote[remoteindex];
+	char buf[BUFF_SIZE], outbuf[BUFF_SIZE];
+	ssize_t n;
+	for (;;) {
+		n = tun_read(tunfd, buf, BUFF_SIZE);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			else {
+				perror("read tun");
+				exit(1);
+				return;
+			}
+		} else {
+			break;
+		}
+	}
+
+	n = mptun_encrypt(buf, n, outbuf, tdev->key, tdev->ti);
+	if (n < 0) {
+		fprintf(stderr, "Invalid tun package size %d", (int)n);
+		return;
+	}
+
+	for (;;) {
+		int ret = send(inetfd, outbuf, n, 0 );
+		if (ret < 0 && errno == EINTR) {
+			continue;
+		} else {
+			break;
+		}
+	}
+}
+
+static void
+inet_to_tun_tcp(struct tundev *tdev, int index) {
+	SOCKADDR sa;
+	int inetfd = tdev->clientfd;
+	int tunfd = tdev->tunfd;
+	char buf[BUFF_SIZE], outbuff[BUFF_SIZE];
+	ssize_t n, rn;
+	for (;;) {
+		socklen_t addrlen = sizeof(sa);
+		n = recv(inetfd, buf, BUFF_SIZE, 0);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			else {
+				perror("recv");
+				exit(1);
+				// fail
+			}
+		} else {
+			break;
+		}
+	}
+
+	rn = mptun_decrypt(buf, n, outbuff, tdev->key, tdev->ti);
+
+	if (rn < 0) {
+		tdev->invalid += n;
+		return;
+	}
+
+	for (;;) {
+		int ret = tun_write(tunfd, outbuff, rn);
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			else {
+				perror("write tun");
+				exit(1);
+			}
+		} else {
+			break;
+		}
+	}
+
+	// succ
+}
+
+static void start_tcp_client(struct tundev* tdev){
+        int clientfd = tdev -> localfd[0];
+        tdev -> clientfd = clientfd;
+        int maxrd = 0;
+        int maxwd = 0;
+        int tunfd = tdev -> tunfd;
+	fd_set rdset, wtset, exset;
+        SOCKADDR * addr = &(tdev -> remote[0]);
+        int connect_error = connect(clientfd, (struct sockaddr *)addr, sizeof(SOCKADDR));
+        if (connect_error){
+          perror("connect_error");
+        }
+	struct sigaction sa;
+	sa.sa_handler = &handle_hup;
+	sa.sa_flags = SA_RESTART;
+	sigfillset(&sa.sa_mask);
+	if (sigaction(SIGHUP, &sa, NULL) == -1) {
+		perror("handle SIGHUP");
+		exit(1);
+	}
+
+	for (;;) {
+
+            FD_ZERO(&rdset);
+            FD_ZERO(&wtset);
+            FD_ZERO(&exset);
+            FD_SET(tunfd, &rdset);
+            FD_SET(clientfd, &rdset);
+            FD_SET(clientfd, &wtset);
+            maxrd = (clientfd > tunfd) ? clientfd : tunfd;
+            maxwd = (clientfd > tunfd) ? clientfd : tunfd;
+
+            tdev->ti = time(NULL);
+
+            if (select(maxrd+1, &rdset, NULL, NULL, NULL) < 0) {
+                perror("select");
+                return;
+            }
+            if (clientfd && FD_ISSET(clientfd, &rdset)) {
+                  fprintf(stderr, "client inet_to_tun");
+                  inet_to_tun_tcp(tdev, 0);
+            }
+
+            if (tunfd && FD_ISSET(tunfd, &rdset)) {
+                  fprintf(stderr, "client tun_to_inet");
+                for (;;) {
+                  int wt_ret = select(maxwd+1, NULL, &wtset, NULL, NULL);
+                  if (wt_ret < 0) {
+                      perror("select");
+                      return;
+                  } else {
+                    break;
+                  }
+                }
+                tun_to_inet_tcp(tdev, NULL);
+            }
+	}
+}
+static void start_tcp_server(struct tundev* tdev){
+        int listenerfd = tdev -> localfd[0];
+        int clientfd = 0;
+        int maxrd = 0;
+        int maxwd = 0;
+        int tunfd = tdev -> tunfd;
+	fd_set rdset, wtset, exset;
+	struct sigaction sa;
+	sa.sa_handler = &handle_hup;
+	sa.sa_flags = SA_RESTART;
+	sigfillset(&sa.sa_mask);
+	if (sigaction(SIGHUP, &sa, NULL) == -1) {
+		perror("handle SIGHUP");
+		exit(1);
+	}
+        if (listenerfd > tunfd){
+          maxrd = listenerfd + 1;
+        } else {
+          maxrd = tunfd + 1;
+        }
+
+	for (;;) {
+            tdev->ti = time(NULL);
+
+            FD_ZERO(&rdset);
+            FD_ZERO(&wtset);
+            FD_ZERO(&exset);
+            FD_SET(tunfd, &rdset);
+            FD_SET(listenerfd, &rdset);
+            if (clientfd){
+               FD_SET(clientfd, &rdset);
+               // TODO: mulit write set 
+               FD_SET(clientfd, &wtset);
+            }
+
+            if (clientfd > maxrd){
+               maxrd = clientfd;
+            }
+
+            if( clientfd > maxwd) {
+              maxwd = clientfd;
+            }
+
+            if (select(maxrd+1, &rdset, NULL, NULL, NULL) < 0) {
+                perror("select");
+                return;
+            }
+
+            if (FD_ISSET(listenerfd, &rdset)) {
+                struct sockaddr_storage ss;
+                socklen_t slen = sizeof(ss);
+                clientfd = accept(listenerfd, (struct sockaddr*)&ss, &slen);
+                fprintf(stderr, "server accept\n");
+                if (clientfd < 0) {
+                    perror("accept");
+                } else if (clientfd > FD_SETSIZE) {
+                    close(clientfd);
+                } else {
+                    tdev -> clientfd = clientfd;
+                }
+            }
+
+            clientfd = tdev -> clientfd;
+
+            if (clientfd && FD_ISSET(clientfd, &rdset)) {
+                  fprintf(stderr, "server inet\n");
+                  inet_to_tun_tcp(tdev, 0);
+            }
+
+            if (tunfd && FD_ISSET(tunfd, &rdset)) {
+                fprintf(stderr, "server tun\n");
+                if (select(maxwd+1, NULL, &wtset, NULL, NULL) < 0) {
+                    perror("select");
+                    return;
+                }
+                tun_to_inet_tcp(tdev, NULL);
+            }
+	}
+}
+
+static void
 ifconfig(const char * ifname, const char * va, const char *pa) {
 	char cmd[1024];
 #if defined(__APPLE__)
@@ -812,7 +1057,7 @@ main(int argc, char *argv[]) {
 	struct tundev tdev;
 	memset(&tdev, 0, sizeof(tdev));
 
-	while ((option = getopt(argc, argv, "i:v:t:r:l:p:k:")) > 0) {
+	while ((option = getopt(argc, argv, "i:v:t:r:l:p:k:o:")) > 0) {
 		INADDR addr;
 		switch(option) {
 		case 'i':
@@ -840,6 +1085,7 @@ main(int argc, char *argv[]) {
 				}
 				tdev.local[tdev.local_n++] = addr;
 			} else {
+                                tdev.is_client = 1;
 				SOCKADDR *sa = &tdev.remote[tdev.remote_n];
 				if (tdev.remote_n >= MAX_ADDRESS) {
 					fprintf(stderr, "Too many remote ip\n");
@@ -852,6 +1098,9 @@ main(int argc, char *argv[]) {
 		case 'k':
 			tdev.key = hash_key(optarg, strlen(optarg));
 			break;
+                case 'o':
+                        tdev.proto = atoi(optarg);
+                        break;
 		default:
 			usage();
 			break;
@@ -874,7 +1123,7 @@ main(int argc, char *argv[]) {
 	}
 
 	for (i=0;i<tdev.local_n;i++) {
-		int fd = inet_bind(&tdev.local[i], tdev.port);
+		int fd = inet_bind(&tdev.local[i], tdev.port, &tdev);
 		if (fd < 0) {
 			// no need to close tdev.localfd[], because exit 1
 			return 1;
@@ -887,7 +1136,15 @@ main(int argc, char *argv[]) {
 		tdev.remote[i].sin_port = htons(tdev.port);
 	}
 
-	start(&tdev);
+        if (tdev.proto) {
+          if (tdev.is_client) {
+            start_tcp_client(&tdev);
+          } else {
+            start_tcp_server(&tdev);
+          }
+        } else {
+          start(&tdev);
+        }
 
 	return 0;
 }
